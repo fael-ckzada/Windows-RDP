@@ -1,5 +1,5 @@
 
-name: Windows RDP Tailscale
+name: Windows RDP V3
 
 on:
   workflow_dispatch:
@@ -13,28 +13,54 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Configurar Windows e RDP
+      - name: Criar usuario administrador
         shell: powershell
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
           $ErrorActionPreference = "Stop"
+          $user = "Fael"
 
-          if (-not $env:RDP_PASSWORD) {
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
             throw "Configure RDP_PASSWORD nos Secrets."
           }
 
-          $user = "Fael"
           $password = ConvertTo-SecureString `
             $env:RDP_PASSWORD -AsPlainText -Force
 
-          New-LocalUser -Name $user `
-            -Password $password `
-            -PasswordNeverExpires
+          if (Get-LocalUser -Name $user -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name $user -Password $password
+          } else {
+            New-LocalUser `
+              -Name $user `
+              -Password $password `
+              -PasswordNeverExpires
+          }
 
-          Add-LocalGroupMember `
-            -Group "Remote Desktop Users" `
-            -Member $user
+          foreach ($group in @("Administrators", "Remote Desktop Users")) {
+            $members = Get-LocalGroupMember -Group $group
+
+            if (-not ($members | Where-Object {
+              $_.Name -eq "$env:COMPUTERNAME\$user"
+            })) {
+              Add-LocalGroupMember -Group $group -Member $user
+            }
+          }
+
+          Write-Host "Usuario Fael configurado."
+
+      - name: Ativar alto desempenho
+        shell: powershell
+        run: |
+          powercfg /setactive SCHEME_MIN
+          powercfg /getactivescheme
+
+          Write-Host "Plano de alto desempenho configurado."
+
+      - name: Configurar RDP
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
 
           Set-ItemProperty `
             -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
@@ -44,10 +70,10 @@ jobs:
             -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
             -Name UserAuthentication -Value 1
 
-          Enable-NetFirewallRule `
-            -DisplayGroup "Remote Desktop"
+          Set-Service TermService -StartupType Automatic
+          Start-Service TermService
 
-          Write-Host "Usuario RDP: Fael"
+          Write-Host "RDP configurado."
 
       - name: Instalar Tailscale
         shell: powershell
@@ -56,7 +82,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          if (-not $env:TS_AUTHKEY) {
+          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
             throw "Configure TAILSCALE_AUTHKEY nos Secrets."
           }
 
@@ -71,7 +97,7 @@ jobs:
             -Wait -PassThru
 
           if ($process.ExitCode -ne 0) {
-            throw "Falha ao instalar Tailscale."
+            throw "Falha na instalacao do Tailscale."
           }
 
           $ts = "${env:ProgramFiles}\Tailscale\tailscale.exe"
@@ -81,21 +107,91 @@ jobs:
             --hostname="fael-windows-rdp"
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Falha ao conectar Tailscale."
+            throw "Falha na autenticacao do Tailscale."
           }
 
           $ip = & $ts ip -4
 
-          Write-Host "=========================="
-          Write-Host "WINDOWS RDP"
-          Write-Host "IP: $ip"
+          if (-not $ip) {
+            throw "IP Tailscale nao encontrado."
+          }
+
+          Write-Host "IP Tailscale: $ip"
+
+      - name: Proteger acesso RDP
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Get-NetFirewallRule -DisplayGroup "Remote Desktop" |
+            Disable-NetFirewallRule
+
+          New-NetFirewallRule `
+            -DisplayName "RDP Tailscale TCP" `
+            -Direction Inbound `
+            -Action Allow `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -InterfaceAlias "Tailscale" `
+            -Profile Any
+
+          Write-Host "Firewall RDP configurado."
+
+      - name: Verificar Microsoft Store e WinGet
+        shell: powershell
+        run: |
+          Write-Host "Verificando Microsoft Store..."
+
+          $store = Get-AppxPackage -AllUsers `
+            -Name Microsoft.WindowsStore
+
+          if ($store) {
+            Write-Host "Microsoft Store encontrada."
+          } else {
+            Write-Host "Microsoft Store indisponivel neste Windows Server."
+          }
+
+          Write-Host "Verificando WinGet..."
+
+          $winget = Get-Command winget -ErrorAction SilentlyContinue
+
+          if ($winget) {
+            winget --version
+          } else {
+            Write-Host "WinGet nao encontrado."
+            Write-Host "Instalacao manual pode ser necessaria."
+          }
+
+      - name: Verificar recursos da VPS
+        shell: powershell
+        run: |
+          Write-Host "========== WINDOWS RDP V3 =========="
+
+          Get-CimInstance Win32_OperatingSystem |
+            Select-Object Caption, Version
+
+          Get-CimInstance Win32_Processor |
+            Select-Object Name, NumberOfLogicalProcessors
+
+          $ram = (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory
+          Write-Host "RAM: $([math]::Round($ram / 1GB, 2)) GB"
+
+          Get-PSDrive C
+
+          Get-CimInstance Win32_VideoController |
+            Select-Object Name
+
+          $ts = "${env:ProgramFiles}\Tailscale\tailscale.exe"
+          $ip = & $ts ip -4
+
+          Write-Host "===================================="
+          Write-Host "IP RDP: $ip"
           Write-Host "USUARIO: Fael"
           Write-Host "PORTA: 3389"
-          Write-Host "=========================="
+          Write-Host "===================================="
 
       - name: Manter Windows ativo
         shell: powershell
         run: |
-          Write-Host "Windows ativo para RDP."
+          Write-Host "Windows RDP V3 ativo."
           Start-Sleep -Seconds 18000
-          
